@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/openai/openai-go/v3"
 )
@@ -10,7 +11,8 @@ func main() {
 	ctx := context.Background()
 	client := openai.NewClient()
 
-	question := "What does the name Chloé mean?"
+	question := "Who is Chloé?"
+	fmt.Printf("Me: %s\n", question)
 
 	chatCompletion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -22,5 +24,5 @@ func main() {
 		panic(err)
 	}
 
-	println(chatCompletion.Choices[0].Message.Content)
+	fmt.Printf("AI: %s\n", chatCompletion.Choices[0].Message.Content)
 }
