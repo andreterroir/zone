@@ -28,7 +28,7 @@ func main() {
 
 	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition}
 	agent := NewAgent(&client, getUserMessage, tools)
-	err := agent.Run(context.TODO()) // what's this?
+	err := agent.Run(context.TODO()) // context for cancellation/timeout control
 	if err != nil {
 		fmt.Printf("Error: %s\n", err.Error())
 	}
@@ -127,11 +127,11 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 			},
 		})
 	}
-	// is a system prompt for tool use included automatically?
+	// the Anthropic API automatically includes system instructions for tool use
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
 
 		Model:     "qwen3.6-plus",
-		MaxTokens: int64(1024), // is the cast needed?
+		MaxTokens: 1024,
 		Messages:  conversation,
 		Tools:     anthropicTools,
 	})
@@ -239,7 +239,7 @@ func ListFiles(input json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(result), nil // string() needed?
+	return string(result), nil // json.Marshal returns []byte
 }
 
 var EditFileDefinition = ToolDefinition{
@@ -282,10 +282,11 @@ func EditFile(input json.RawMessage) (string, error) {
 	}
 
 	oldContent := string(content)
-	// what's -1?
-	newContent := strings.Replace(oldContent, editFileInput.OldStr, editFileInput.NewStr, -1)
+	// replace all occurrences
+	const replaceAll = -1
+	newContent := strings.Replace(oldContent, editFileInput.OldStr, editFileInput.NewStr, replaceAll)
 
-	// why do we check if the old string is not empty?
+	// empty oldStr means new file creation; skip equality check to avoid false "not found" error
 	if oldContent == newContent && editFileInput.OldStr != "" {
 		return "", fmt.Errorf("old_str not found in file")
 	}
@@ -303,7 +304,7 @@ func createNewFile(filePath, content string) (string, error) {
 	if dir != "." {
 		err := os.MkdirAll(dir, 0755)
 		if err != nil {
-			// what's %w?
+			// %w wraps the error for proper error chain unwrapping
 			return "", fmt.Errorf("failed to create directory: %w", err)
 		}
 	}
