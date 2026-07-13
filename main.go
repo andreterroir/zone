@@ -130,8 +130,8 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 	// the Anthropic API automatically includes system instructions for tool use
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
 
-		Model:     "qwen3.6-plus",
-		MaxTokens: 1024,
+		Model:     "minimax-m3",
+		MaxTokens: 10000,
 		Messages:  conversation,
 		Tools:     anthropicTools,
 	})
