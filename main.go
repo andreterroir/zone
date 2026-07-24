@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/invopop/jsonschema"
@@ -26,7 +28,7 @@ func main() {
 		return scanner.Text(), true
 	}
 
-	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition}
+	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, BashDefinition}
 	agent := NewAgent(&client, getUserMessage, tools)
 	err := agent.Run(context.TODO()) // context for cancellation/timeout control
 	if err != nil {
@@ -297,6 +299,80 @@ func EditFile(input json.RawMessage) (string, error) {
 	}
 
 	return "OK", nil
+}
+
+var BashDefinition = ToolDefinition{
+	Name:        "bash",
+	Description: "Execute a single bash command and return its output. Runs the command via `/bin/bash -c <cmd>` in the current working directory with the inherited environment. Output is returned as a JSON object: {\"stdout\", \"stderr\", \"exit_code\", \"duration_ms\"}. Non-zero exit codes are reported as successful tool results (is_error=false) so the model can read stderr and react; only execution failures (e.g. command not found, timeout) are returned as is_error=true.",
+	InputSchema: BashInputSchema,
+	Function:    Bash,
+}
+
+type BashInput struct {
+	Cmd string `json:"cmd" jsonschema_description:"The bash command to execute. Runs via /bin/bash -c with a 30s default timeout. Output is returned as a JSON object with stdout, stderr, exit_code, and duration_ms fields."`
+}
+
+var BashInputSchema = GenerateSchema[BashInput]()
+
+const bashDefaultTimeout = 30 * time.Second
+
+func Bash(input json.RawMessage) (string, error) {
+	bashInput := BashInput{}
+	err := json.Unmarshal(input, &bashInput)
+	if err != nil {
+		return "", err
+	}
+	if bashInput.Cmd == "" {
+		return "", fmt.Errorf("invalid input parameters")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), bashDefaultTimeout)
+	defer cancel()
+
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", bashInput.Cmd)
+	stdoutBuf := &strings.Builder{}
+	stderrBuf := &strings.Builder{}
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
+
+	runErr := cmd.Run()
+	durationMs := time.Since(start).Milliseconds()
+
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+
+	result := map[string]any{
+		"stdout":      stdoutBuf.String(),
+		"stderr":      stderrBuf.String(),
+		"exit_code":   exitCode,
+		"duration_ms": durationMs,
+	}
+
+	// Distinguish: a non-zero exit is a successful *tool call* (the command ran;
+	// the model should see stderr and decide what to do). A real execution
+	// failure (command missing, timeout, etc.) is an is_error=true result.
+	if runErr != nil {
+		// context.DeadlineExceeded is the timeout case.
+		if ctx.Err() == context.DeadlineExceeded {
+			result["error"] = "command timed out after " + bashDefaultTimeout.String()
+			result["timed_out"] = true
+		} else if ee, ok := runErr.(*exec.ExitError); ok {
+			// Non-zero exit. Already captured exit_code above; no extra error field.
+			_ = ee
+		} else {
+			// Couldn't even start the command (e.g. /bin/bash missing).
+			result["error"] = runErr.Error()
+		}
+	}
+
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func createNewFile(filePath, content string) (string, error) {
