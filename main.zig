@@ -1,103 +1,66 @@
-// main.zig — REPL-style agent that talks to an Anthropic-compatible Messages API.
-//
-// Default target: OpenCode Go Anthropic-compatible endpoint, model `minimax-m3`.
-// Override base URL with `ANTHROPIC_BASE_URL` and model with `MODEL`.
-// API key is always read from `API_KEY`; the program exits if it is missing.
-//
-// Build / run:  zig run main.zig
-//
-// No external dependencies — Zig 0.16.0 standard library only.
-//
-// In Zig 0.16.0 the debug-checking allocator is `std.heap.DebugAllocator`
-// (formerly `std.heap.GeneralPurposeAllocator`).
-
 const std = @import("std");
+const Io = std.Io;
 
-const max_response_bytes: usize = 1 * 1024 * 1024; // 1 MiB response cap
-const max_file_bytes: usize = 1 * 1024 * 1024; // 1 MiB cap on files read/written by tools
+// ---------------------------------------------------------------------------
+// Configuration constants
+// ---------------------------------------------------------------------------
 
-// ---- ANSI colors ------------------------------------------------------------
+/// Upper bound on a single API response body (1 MiB). See README.md.
+const max_response_bytes: usize = 1 * 1024 * 1024;
 
-const c_reset = "\x1b[0m";
-const c_you = "\x1b[94m";
-const c_ai = "\x1b[93m";
-const c_tool = "\x1b[92m";
+/// Upper bound on a single file read/edit (1 MiB). See README.md.
+const max_file_bytes: usize = 1 * 1024 * 1024;
 
-// In Zig 0.16.0, the `std.fs.File` struct was removed. Files are now just
-// `std.posix.fd_t` integers, and the `std.posix.read` / `std.posix.write`
-// free functions were also relocated. We use the C standard library's
-// `read` / `write` directly via the same `c` import as the env helpers.
-// The standard streams are exposed as the `STD{IN,OUT,ERR}_FILENO` constants
-// on `std.posix`.
-const stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO;
-const stdout_fd: std.posix.fd_t = std.posix.STDOUT_FILENO;
-const stderr_fd: std.posix.fd_t = std.posix.STDERR_FILENO;
+/// Default base URL — the OpenCode Anthropic-compatible endpoint.
+/// Note: `std.http.Client` is given just the host root, but the Messages
+/// API lives at `${base}/v1/messages`. We append `/v1/messages` in
+/// `sendMessage` so this constant stays a clean host.
+/// Overridable via `ANTHROPIC_BASE_URL`.
+const default_base_url: []const u8 = "https://opencode.ai/zen/go";
 
-// We use `[*c]` (C many-pointer) for the buffer so the C ABI is happy — in
-// particular the aarch64_aapcs_darwin calling convention (Apple Silicon)
-// does not allow Zig slice types (`[]u8` / `[]const u8`) in `extern "c"`
-// declarations, because a Zig slice is a fat `{ptr, len}` struct that the C
-// ABI doesn't know how to lower. With `[*c]const u8` Zig passes just the
-// pointer, which is exactly what POSIX `read`/`write` expect (they take
-// `void *` plus an explicit `size_t` length). The length is supplied
-// separately, so the slice's own length is ignored — which is what we want.
-extern "c" fn write(fd: c_int, buf: [*c]const u8, count: usize) isize;
-extern "c" fn read(fd: c_int, buf: [*c]u8, count: usize) isize;
+/// Default model name. Overridable via `MODEL`.
+const default_model: []const u8 = "minimax-m3";
 
-fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const n = write(fd, bytes[written..].ptr, bytes.len - written);
-        if (n < 0) return error.WriteFailed;
-        if (n == 0) return error.WriteZero;
-        written += @intCast(n);
-    }
+/// Hard-coded path to the shell, matching the Go version. The Go version uses
+/// `/bin/bash` directly. (Cross-platform shimming is out of scope.)
+const bash_path: []const u8 = "/bin/bash";
+
+// ---------------------------------------------------------------------------
+// ANSI color helpers
+// ---------------------------------------------------------------------------
+
+const c_you: []const u8 = "\x1b[94m";
+const c_ai: []const u8 = "\x1b[93m";
+const c_tool: []const u8 = "\x1b[92m";
+const c_reset: []const u8 = "\x1b[0m";
+
+// ---------------------------------------------------------------------------
+// Environment helpers
+// ---------------------------------------------------------------------------
+
+/// `getEnvOr` — return the value of env var `name`, or `default` if the
+/// variable is missing or empty. Uses `std.process.Environ.getPosix`
+/// (Zig 0.16) which walks the env block captured by the runtime at
+/// startup — `std.c.getenv` no longer works because Zig 0.16's
+/// standalone runtime does not populate the libc `environ` global.
+fn getEnvOr(environ: std.process.Environ, name: []const u8, default: []const u8) []const u8 {
+    const value = std.process.Environ.getPosix(environ, name) orelse return default;
+    if (value.len == 0) return default;
+    return value;
 }
 
-fn printFd(fd: std.posix.fd_t, comptime fmt: []const u8, args: anytype) !void {
-    var buf: [4096]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, fmt, args);
-    try writeAll(fd, s);
-}
-
-// ---- env helpers ------------------------------------------------------------
-
-// `getenv` is a C standard library function. In Zig 0.16.0 it is no longer
-// re-exported under `std.posix`, so we declare it via a tiny C import.
-const c = @cImport({
-    @cInclude("stdlib.h");
-});
-
-fn getEnvOr(arena: std.mem.Allocator, key: []const u8, default: []const u8) ![]const u8 {
-    _ = arena;
-    const value = c.getenv(key.ptr);
-    if (value) |v| {
-        return std.mem.span(v);
-    }
-    return default;
-}
-
-// ---- Tool JSON schemas (inline, static) -------------------------------------
-
-const read_file_schema =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"The relative path of a file in the working directory."}},"required":["path"],"additionalProperties":false}
-;
-
-const list_files_schema =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Optional relative path to list files from. Defaults to current directory if not provided."}},"required":[],"additionalProperties":false}
-;
-
-const edit_file_schema =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"The path to the file"},"old_str":{"type":"string","description":"Text to search for - must match exactly and must only have one match exactly"},"new_str":{"type":"string","description":"Text to replace old_str with"}},"required":["path","old_str","new_str"],"additionalProperties":false}
-;
-
-// ---- Tool input structs -----------------------------------------------------
+// ---------------------------------------------------------------------------
+// Tool input structs and inline JSON schemas
+// ---------------------------------------------------------------------------
 
 const ReadFileInput = struct {
     path: []const u8,
 };
 
 const ListFilesInput = struct {
+    /// Optional relative path. `parseFromValueLeaky` treats a JSON `null` as
+    /// a present-but-null value, so the field is optional by virtue of being
+    /// absent from `required` in the schema.
     path: ?[]const u8 = null,
 };
 
@@ -107,9 +70,35 @@ const EditFileInput = struct {
     new_str: []const u8,
 };
 
-// ---- Tool dispatch ----------------------------------------------------------
+const BashInput = struct {
+    cmd: []const u8,
+};
 
-const ToolFn = *const fn (input: std.json.Value, arena: std.mem.Allocator) anyerror![]const u8;
+const read_file_schema: []const u8 =
+    \\{"type":"object","properties":{"path":{"type":"string","description":"The relative path of a file in the working directory."}},"required":["path"],"additionalProperties":false}
+;
+
+const list_files_schema: []const u8 =
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Optional relative path to list files from. Defaults to current directory if not provided."}},"required":[],"additionalProperties":false}
+;
+
+const edit_file_schema: []const u8 =
+    \\{"type":"object","properties":{"path":{"type":"string","description":"The path to the file"},"old_str":{"type":"string","description":"Text to search for - must match exactly and must only have one match exactly"},"new_str":{"type":"string","description":"Text to replace old_str with"}},"required":["path","old_str","new_str"],"additionalProperties":false}
+;
+
+const bash_schema: []const u8 =
+    \\{"type":"object","properties":{"cmd":{"type":"string","description":"The bash command to execute. Runs via /bin/bash -c with a 30s default timeout. Output is returned as a JSON object with stdout, stderr, exit_code, and duration_ms fields."}},"required":["cmd"],"additionalProperties":false}
+;
+
+// ---------------------------------------------------------------------------
+// Tool definition / dispatch
+// ---------------------------------------------------------------------------
+
+const ToolFn = *const fn (
+    value: std.json.Value,
+    arena: std.mem.Allocator,
+    io: Io,
+) anyerror![]const u8;
 
 const ToolDef = struct {
     name: []const u8,
@@ -118,7 +107,7 @@ const ToolDef = struct {
     func: ToolFn,
 };
 
-const tools = [_]ToolDef{
+const tools: []const ToolDef = &.{
     .{
         .name = "read_file",
         .description = "Read the contents of a given relative file path. use this when you want to see what's inside a file. Do not use this with directory names.",
@@ -127,7 +116,7 @@ const tools = [_]ToolDef{
     },
     .{
         .name = "list_files",
-        .description = "List files and directories at a given path. If no path is provided, lists files in the current directory.",
+        .description = "List files and directories at a given path. If no path is provided, lists files in the current directory. One level deep only.",
         .schema = list_files_schema,
         .func = toolListFiles,
     },
@@ -143,6 +132,12 @@ const tools = [_]ToolDef{
         .schema = edit_file_schema,
         .func = toolEditFile,
     },
+    .{
+        .name = "bash",
+        .description = "Execute a single bash command and return its output. Runs the command via `/bin/bash -c <cmd>` in the current working directory with the inherited environment. Output is returned as a JSON object: {\"stdout\", \"stderr\", \"exit_code\", \"duration_ms\"}. Non-zero exit codes are reported as successful tool results (is_error=false) so the model can see stderr and react; only execution failures (command not found, timeout) are returned as is_error=true.",
+        .schema = bash_schema,
+        .func = toolBash,
+    },
 };
 
 fn findTool(name: []const u8) ?ToolDef {
@@ -152,398 +147,762 @@ fn findTool(name: []const u8) ?ToolDef {
     return null;
 }
 
-// ---- Tool implementations ---------------------------------------------------
+// ---------------------------------------------------------------------------
+// Tool implementations
+// ---------------------------------------------------------------------------
 
-fn toolReadFile(input: std.json.Value, arena: std.mem.Allocator) ![]const u8 {
-    const parsed = try std.json.parseFromValueLeaky(ReadFileInput, arena, input, .{});
-    const content = try std.fs.cwd().readFileAlloc(arena, parsed.path, max_file_bytes);
-    return content;
+/// Capped version of `readAllArrayList` — reads until EOF or until `limit`
+/// bytes have been consumed. Zig 0.16's `std.Io` doesn't expose a
+/// public `readAllArrayList` helper, so we roll one. The returned
+/// slice is allocated by `gpa`; the caller owns and must free it.
+fn readCapped(gpa: std.mem.Allocator, reader: *Io.Reader, limit: usize) ![]u8 {
+    var buf: std.array_list.Managed(u8) = std.array_list.Managed(u8).init(gpa);
+    defer buf.deinit();
+    try buf.ensureTotalCapacity(@min(limit, 4096));
+
+    // Read in chunks. We always pass the same fixed scratch buffer;
+    // `readSliceShort` returns the number of bytes consumed.
+    var scratch: [4096]u8 = undefined;
+    while (buf.items.len < limit) {
+        const want = @min(limit - buf.items.len, scratch.len);
+        const slice = scratch[0..want];
+        const got = reader.readSliceShort(slice) catch return error.ReadFailed;
+        if (got == 0) break;
+        try buf.appendSlice(slice[0..got]);
+    }
+    return buf.toOwnedSlice();
 }
 
-fn toolListFiles(input: std.json.Value, arena: std.mem.Allocator) ![]const u8 {
-    const parsed = try std.json.parseFromValueLeaky(ListFilesInput, arena, input, .{});
-    const dir_path = parsed.path orelse ".";
+/// `read_file` — bounded read of a file relative to cwd. Capped at
+/// `max_file_bytes` (1 MiB) — see README.md.
+fn toolReadFile(
+    value: std.json.Value,
+    arena: std.mem.Allocator,
+    io: Io,
+) anyerror![]const u8 {
+    const input = try std.json.parseFromValueLeaky(ReadFileInput, arena, value, .{ .ignore_unknown_fields = true });
 
-    var out: std.array_list.Aligned(u8, null) = .empty;
-    var first = true;
-    const writer = out.writer(arena);
-    try writer.writeAll("[");
+    const dir = Io.Dir.cwd();
+    var file = dir.openFile(io, input.path, .{}) catch |err| return err;
+    defer file.close(io);
 
-    var walker = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-    defer walker.close();
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    // `readCapped` allocates with `arena`; arena lifetime is the whole
+    // session, so the returned slice is fine.
+    const raw = try readCapped(arena, &reader.interface, max_file_bytes);
+    return raw;
+}
 
-    var it = walker.iterate();
-    while (try it.next()) |entry| {
-        if (!first) try writer.writeAll(",");
-        first = false;
-        const name = entry.name;
-        const suffix: []const u8 = if (entry.kind == .directory) "/" else "";
-        try std.json.stringify(name, .{}, writer);
-        try writer.writeAll(suffix);
+/// `list_files` — shallow directory listing. Cwd if `path` is missing/empty.
+fn toolListFiles(
+    value: std.json.Value,
+    arena: std.mem.Allocator,
+    io: Io,
+) anyerror![]const u8 {
+    const input = try std.json.parseFromValueLeaky(ListFilesInput, arena, value, .{ .ignore_unknown_fields = true });
+
+    const dir_path = input.path orelse ".";
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    // One-level listing using the Io.Dir.Iterator. We accumulate names and
+    // skip "." / "..". The Go version recurses with `filepath.Walk`; the
+    // Zig port is intentionally shallow (see README.md "Behavior
+    // differences").
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(arena);
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        // Duplicate into the arena so the slice outlives the iterator
+        // buffer.
+        try names.append(arena, try arena.dupe(u8, entry.name));
     }
 
-    try writer.writeAll("]");
-    return out.items;
+    // Hand the list off to `Stringify.valueAlloc`, which knows how to
+    // emit a JSON array of strings — same shape as the Go version's
+    // `json.Marshal([]string{...})`.
+    return try std.json.Stringify.valueAlloc(arena, names.items, .{});
 }
 
-fn toolEditFile(input: std.json.Value, arena: std.mem.Allocator) ![]const u8 {
-    const parsed = try std.json.parseFromValueLeaky(EditFileInput, arena, input, .{});
+/// Edit-file helper: create a brand-new file (and any missing parent
+/// directories) with `content`, returning a "Successfully created file ..."
+/// message. Mirrors the Go version's `createNewFile` helper.
+fn createNewFile(
+    arena: std.mem.Allocator,
+    io: Io,
+    file_path: []const u8,
+    content: []const u8,
+) ![]const u8 {
+    // Recreate parent directory if needed. `Io.Dir.createDirPath` is a
+    // stdlib primitive that walks the path components and creates each
+    // missing directory.
+    if (std.fs.path.dirname(file_path)) |parent| {
+        if (parent.len > 0 and !std.mem.eql(u8, parent, ".")) {
+            try Io.Dir.cwd().createDirPath(io, parent);
+        }
+    }
+    const dir = Io.Dir.cwd();
+    const mode: Io.File.CreateFlags = .{ .read = true, .truncate = true };
+    var file = try dir.createFile(io, file_path, mode);
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
 
-    if (parsed.path.len == 0 or std.mem.eql(u8, parsed.old_str, parsed.new_str)) {
+    return std.fmt.allocPrint(arena, "Successfully created file {s}", .{file_path});
+}
+
+/// `edit_file` — replace `old_str` with `new_str` in `path`. Creates the
+/// file if it doesn't exist and `old_str` is empty. Replaces *all*
+/// occurrences. Returns the string "OK" on success.
+fn toolEditFile(
+    value: std.json.Value,
+    arena: std.mem.Allocator,
+    io: Io,
+) anyerror![]const u8 {
+    const input = try std.json.parseFromValueLeaky(EditFileInput, arena, value, .{ .ignore_unknown_fields = true });
+
+    if (input.path.len == 0 or std.mem.eql(u8, input.old_str, input.new_str)) {
         return error.InvalidInputParameters;
     }
 
-    const content = std.fs.cwd().readFileAlloc(arena, parsed.path, max_file_bytes) catch |err| switch (err) {
+    const dir = Io.Dir.cwd();
+    const file = dir.openFile(io, input.path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
-            if (parsed.old_str.len == 0) {
-                return createNewFile(arena, parsed.path, parsed.new_str);
+            if (input.old_str.len == 0) {
+                return createNewFile(arena, io, input.path, input.new_str);
             }
             return err;
         },
         else => return err,
     };
+    defer file.close(io);
 
-    // replace all occurrences of old_str with new_str
-    var current: []u8 = try arena.dupe(u8, content);
-    var total_replaced: usize = 0;
-    while (std.mem.indexOf(u8, current, parsed.old_str)) |idx| {
-        const after = idx + parsed.old_str.len;
-        const replaced = try std.mem.replaceOwned(u8, arena, current, parsed.old_str, parsed.new_str);
-        total_replaced += 1;
-        if (replaced.len == current.len) break; // safety
-        _ = after;
-        current = replaced;
-    }
+    // Read up to `max_file_bytes` so the whole replace operates in memory.
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    const old_content = try readCapped(arena, &reader.interface, max_file_bytes);
 
-    // empty old_str means new-file creation; skip the "not found" check in that case.
-    if (total_replaced == 0 and parsed.old_str.len != 0) {
+    // `std.mem.replaceOwned` already replaces all occurrences internally
+    // (it delegates to `replace` which loops), so this is just one call
+    // — matching the Go version's `strings.Replace(..., -1)`.
+    const new_content = try std.mem.replaceOwned(
+        u8,
+        arena,
+        old_content,
+        input.old_str,
+        input.new_str,
+    );
+
+    if (std.mem.eql(u8, old_content, new_content) and input.old_str.len > 0) {
         return error.OldStrNotFound;
     }
 
-    const file = try std.fs.cwd().createFile(parsed.path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(current);
+    var out = try dir.createFile(io, input.path, .{ .read = true, .truncate = true });
+    defer out.close(io);
+    try out.writeStreamingAll(io, new_content);
 
     return "OK";
 }
 
-fn createNewFile(arena: std.mem.Allocator, file_path: []const u8, content: []const u8) ![]const u8 {
-    if (std.fs.path.dirname(file_path)) |dir| {
-        if (!std.mem.eql(u8, dir, ".") and dir.len != 0) {
-            try std.fs.cwd().makePath(dir);
+/// `bash` — run a single command via `/bin/bash -c <cmd>`. Mirrors the Go
+/// version: stdin is ignored, stdout/stderr are captured, the result is a
+/// JSON object `{stdout, stderr, exit_code, duration_ms}`. A non-zero
+/// exit is a successful *tool* call; only timeout/spawn failures are
+/// `is_error`.
+fn toolBash(
+    value: std.json.Value,
+    arena: std.mem.Allocator,
+    io: Io,
+) anyerror![]const u8 {
+    const input = try std.json.parseFromValueLeaky(BashInput, arena, value, .{ .ignore_unknown_fields = true });
+    if (input.cmd.len == 0) return error.InvalidInputParameters;
+
+    const argv = [_][]const u8{ bash_path, "-c", input.cmd };
+    const start_ts = Io.Clock.awake.now(io);
+    const result = std.process.run(std.heap.page_allocator, io, .{
+        .argv = &argv,
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = Io.Duration.fromSeconds(30),
+        } },
+        .stdout_limit = .unlimited,
+        .stderr_limit = .unlimited,
+    }) catch |err| return err;
+    const duration_ms: i64 = @intCast(@divFloor(
+        start_ts.durationTo(Io.Clock.awake.now(io)).nanoseconds,
+        std.time.ns_per_ms,
+    ));
+
+    // `RunResult.term` is a `Child.Term` discriminated union. Go's
+    // `cmd.ProcessState.ExitCode()` returns -1 for signal-killed,
+    // stopped, or unknown children, so we mirror that for parity.
+    const exit_code: i64 = switch (result.term) {
+        .exited => |code| code,
+        .signal, .stopped, .unknown => -1,
+    };
+
+    const stdout = result.stdout;
+    const stderr = result.stderr;
+    defer {
+        std.heap.page_allocator.free(stdout);
+        std.heap.page_allocator.free(stderr);
+    }
+
+    return try std.json.Stringify.valueAlloc(arena, BashResult{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = exit_code,
+        .duration_ms = duration_ms,
+    }, .{});
+}
+
+const BashResult = struct {
+    stdout: []const u8,
+    stderr: []const u8,
+    exit_code: i64,
+    duration_ms: i64,
+};
+
+// ---------------------------------------------------------------------------
+// Anthropic-compatible Messages API
+// ---------------------------------------------------------------------------
+
+const ContentBlockParam = union(enum) {
+    text: TextBlock,
+    tool_use: ToolUseBlock,
+    tool_result: ToolResultBlock,
+
+    pub const TextBlock = struct {
+        type: []const u8 = "text",
+        text: []const u8,
+    };
+
+    pub const ToolUseBlock = struct {
+        type: []const u8 = "tool_use",
+        id: []const u8,
+        name: []const u8,
+        input: std.json.Value,
+    };
+
+    pub const ToolResultBlock = struct {
+        type: []const u8 = "tool_result",
+        tool_use_id: []const u8,
+        content: []const u8,
+        is_error: bool = false,
+    };
+
+    /// Emit `{"type":"<tag>", ...payload}` directly from the union tag.
+    /// Saves a manual `ObjectMap` per content block in `buildRequestBody`.
+    pub fn jsonStringify(self: ContentBlockParam, jws: anytype) !void {
+        switch (self) {
+            .text => |t| try jws.write(t),
+            .tool_use => |t| try jws.write(t),
+            .tool_result => |t| try jws.write(t),
         }
     }
+};
 
-    const file = try std.fs.cwd().createFile(file_path, .{});
-    defer file.close();
-    try file.writeAll(content);
+const MessageParam = struct {
+    role: []const u8,
+    content: []const ContentBlockParam,
+};
 
-    return try std.fmt.allocPrint(arena, "Successfully created file {s}", .{file_path});
-}
+const Tool = struct {
+    name: []const u8,
+    description: []const u8,
+    input_schema: std.json.Value,
+};
 
-// ---- API helper -------------------------------------------------------------
-
-const Conversation = std.array_list.Aligned(std.json.Value, null);
-
-fn sendMessage(
-    arena: std.mem.Allocator,
-    base_url: []const u8,
-    api_key: []const u8,
+const Request = struct {
     model: []const u8,
-    conversation: *const Conversation,
-) !std.json.Parsed(std.json.Value) {
-    // 1. Build the request body.
-    const body = try buildRequestBody(arena, model, conversation);
+    max_tokens: u64 = 10000,
+    messages: []const MessageParam,
+    tools: []const Tool,
+};
 
-    // 2. POST to {base_url}/v1/messages via std.http.Client.fetch.
-    //
-    // Response body size is bounded by `max_append_size` below, which
-    // caps how much the client's append buffer will grow while reading.
-    // TODO: verify the exact `FetchOptions` field name in 0.16.0 (it has
-    // changed across releases — `max_append_size` / `max_chunk_size` /
-    // `max_size` — pick whichever this version exposes).
-    var client = std.http.Client{ .allocator = arena };
-    defer client.deinit();
+/// Parsed shape of a single `content` block in a model response.
+const ResponseContent = struct {
+    id: []const u8 = "",
+    name: []const u8 = "",
+    input: std.json.Value = .null,
+};
 
-    const url = try std.fmt.allocPrint(arena, "{s}/v1/messages", .{base_url});
+const ParsedResponse = struct {
+    text_blocks: []const []const u8,
+    tool_calls: []const ResponseContent,
+};
 
-    const response_storage = try arena.create(std.http.Client.FetchResponse);
-    const fetch_result = try client.fetch(.{
-        .method = .POST,
-        .location = .{ .url = url },
-        .extra_headers = &.{
-            .{ .name = "x-api-key", .value = api_key },
-            .{ .name = "anthropic-version", .value = "2023-06-01" },
-            .{ .name = "content-type", .value = "application/json" },
-        },
-        .payload = body,
-        .response_storage = response_storage,
-        .max_append_size = max_response_bytes,
-    });
-    defer fetch_result.deinit();
-
-    // 3. Read the body.
-    var body_buf: std.array_list.Aligned(u8, null) = .empty;
-    try body_buf.ensureTotalCapacity(arena, 4096);
-    try fetch_result.reader.readAllArrayList(&body_buf, max_response_bytes);
-
-    // 4. Parse the body as JSON.
-    return try std.json.parseFromSlice(std.json.Value, arena, body_buf.items, .{});
-}
-
-fn buildRequestBody(arena: std.mem.Allocator, model: []const u8, conversation: *const Conversation) ![]u8 {
-    var buf: std.array_list.Aligned(u8, null) = .empty;
-    try buf.ensureTotalCapacity(arena, 1024);
-    const w = buf.writer(arena);
-
-    try w.writeAll("{");
-    try std.json.stringify("model", .{}, w);
-    try w.writeAll(":");
-    try std.json.stringify(model, .{}, w);
-    try w.writeAll(",");
-    try std.json.stringify("max_tokens", .{}, w);
-    try w.writeAll(":1024");
-    try w.writeAll(",");
-    try std.json.stringify("messages", .{}, w);
-    try w.writeAll(":");
-    try std.json.stringify(conversation.items, .{}, w);
-    try w.writeAll(",");
-    try std.json.stringify("tools", .{}, w);
-    try w.writeAll(":[");
-    for (tools, 0..) |t, i| {
-        if (i != 0) try w.writeAll(",");
-        // input_schema must be a JSON object, not a string — parse it.
-        const schema_parsed = try std.json.parseFromSlice(std.json.Value, arena, t.schema, .{});
-        try std.json.stringify(.{
+/// Build the request envelope for one API call. Returns a fresh
+/// `[]u8` allocated by `arena` containing the JSON-encoded body.
+/// Sub-values (`input_schema` parsed objects, etc.) are kept alive by
+/// the arena for the duration of the request.
+fn buildRequestBody(
+    arena: std.mem.Allocator,
+    model: []const u8,
+    messages: []const MessageParam,
+    tool_defs: []const ToolDef,
+) ![]u8 {
+    var tools_arr: std.ArrayList(Tool) = .empty;
+    defer tools_arr.deinit(arena);
+    for (tool_defs) |t| {
+        // Parse the schema into the same arena so the interned strings
+        // live as long as the request.
+        const input_schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, t.schema, .{});
+        try tools_arr.append(arena, .{
             .name = t.name,
             .description = t.description,
-            .input_schema = schema_parsed.value,
-        }, .{}, w);
+            .input_schema = input_schema,
+        });
     }
-    try w.writeAll("]}");
-    return buf.items;
+
+    const request: Request = .{
+        .model = model,
+        .messages = messages,
+        .tools = tools_arr.items,
+    };
+    return try std.json.Stringify.valueAlloc(arena, request, .{});
 }
 
-// ---- Response handling ------------------------------------------------------
+/// Send one Messages API request and return the parsed response. The
+/// response is a `std.json.Value` tree; the caller is responsible for
+/// walking it.
+fn sendMessage(
+    arena: std.mem.Allocator,
+    client: *std.http.Client,
+    extra_headers: []const std.http.Header,
+    base_url: []const u8,
+    body_bytes: []const u8,
+) !std.json.Value {
+    const uri = blk: {
+        // The Anthropic Messages API lives at `${base_url}/v1/messages`.
+        // Some hosts (e.g. OpenCode's `/zen/go`) already include a
+        // versioned path, and the user-provided `ANTHROPIC_BASE_URL`
+        // may already end with `/v1` or `/v1/messages`. We naively
+        // append `/v1/messages`; if a user wants a different path,
+        // they can override `API_PATH` (or just supply the full URL).
+        const full_path = std.fmt.allocPrint(arena, "{s}/v1/messages", .{base_url}) catch {
+            return error.OutOfMemory;
+        };
+        break :blk std.Uri.parse(full_path) catch |err| {
+            std.log.err("invalid ANTHROPIC_BASE_URL {s}: {t}", .{ base_url, err });
+            return err;
+        };
+    };
 
-const ToolCall = struct {
-    id: []const u8,
-    name: []const u8,
-    input: std.json.Value,
-};
+    // Build the request and send the body in one call. `sendBodyComplete`
+    // sets up content-length and flushes; we don't need to manage the
+    // BodyWriter ourselves.
+    //
+    // `headers.accept_encoding = .override("identity")` opts out of
+    // gzip — `std.http.Client` in Zig 0.16 advertises gzip by default
+    // and does *not* auto-decompress, so a gzipped response would be
+    // opaque to our JSON parser. The Anthropic SDK does the same.
+    var req = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .handle_continue = true,
+        .extra_headers = extra_headers,
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+        },
+    });
+    defer req.deinit();
+    // `sendBodyComplete` takes `[]u8` (mutable) for the body because
+    // the BodyWriter updates the end pointer internally. The body lives
+    // in arena-allocated storage, which is mutable in practice; the
+    // `[]const u8` type from `Stringify.valueAlloc` is overly strict.
+    try req.sendBodyComplete(@constCast(body_bytes));
 
-const Turn = struct {
-    text: []const u8,
-    tool_calls: []ToolCall,
-};
+    // The HTTP response is the only place we need a 1 MiB cap. We use the
+    // `receiveHead` + bounded body read pattern: Zig 0.16's
+    // `FetchOptions` has no size-limiting field, so we cap on the
+    // reader side.
+    var response = try req.receiveHead(&.{});
+    const status_class = response.head.status.class();
+    if (status_class != .success) {
+        std.log.err("API returned status {d} {s}", .{
+            @intFromEnum(response.head.status),
+            response.head.reason,
+        });
+        return error.ApiError;
+    }
 
-/// Walks the response value, prints text blocks to stdout, and returns
-/// the aggregated text + tool calls (owned by `arena`).
-fn handleResponse(arena: std.mem.Allocator, response: std.json.Value) !Turn {
-    var text: std.array_list.Aligned(u8, null) = .empty;
-    var calls: std.array_list.Aligned(ToolCall, null) = .empty;
+    var transfer: [4096]u8 = undefined;
+    const reader = response.reader(&transfer);
+    // `readCapped` allocates with `arena`; the slice is then parsed
+    // into the same arena, so the raw buffer is freed after parsing.
+    const raw = try readCapped(std.heap.page_allocator, reader, max_response_bytes);
+    defer std.heap.page_allocator.free(raw);
 
-    const content = response.object.get("content") orelse return .{ .text = "", .tool_calls = &.{} };
-    if (content != .array) return .{ .text = "", .tool_calls = &.{} };
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch |err| {
+        std.log.err("JSON parse failed ({t}); raw body ({d} bytes): {s}", .{ err, raw.len, raw });
+        return error.SyntaxError;
+    };
+    return parsed;
+}
 
-    for (content.array.items) |block| {
-        if (block != .object) continue;
-        const obj = block.object;
+/// Walk the response's `content` array and split it into text blocks and
+/// tool_use blocks. Mirrors the Go version's loop over `message.Content`.
+fn handleResponse(arena: std.mem.Allocator, response: std.json.Value) !ParsedResponse {
+    const content_arr = switch (response) {
+        .object => |o| o.get("content") orelse .null,
+        else => .null,
+    };
+    const items = switch (content_arr) {
+        .array => |a| a.items,
+        else => &[_]std.json.Value{},
+    };
 
-        const type_str = obj.get("type") orelse continue;
-        if (type_str != .string) continue;
+    var text_blocks: std.array_list.Managed([]const u8) = std.array_list.Managed([]const u8).init(std.heap.page_allocator);
+    defer text_blocks.deinit();
+    var tool_calls: std.array_list.Managed(ResponseContent) = std.array_list.Managed(ResponseContent).init(std.heap.page_allocator);
+    defer tool_calls.deinit();
 
-        if (std.mem.eql(u8, type_str.string, "text")) {
-            const t = obj.get("text") orelse continue;
-            if (t == .string) {
-                try text.appendSlice(arena, t.string);
-                try text.append(arena, '\n');
-            }
-        } else if (std.mem.eql(u8, type_str.string, "tool_use")) {
-            const id = obj.get("id") orelse continue;
-            const name = obj.get("name") orelse continue;
-            const input = obj.get("input") orelse continue;
-            if (id != .string or name != .string) continue;
-            try calls.append(arena, .{
-                .id = id.string,
-                .name = name.string,
+    for (items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const type_str = switch (obj.get("type") orelse .null) {
+            .string => |s| s,
+            else => continue,
+        };
+        if (std.mem.eql(u8, type_str, "text")) {
+            const text = switch (obj.get("text") orelse .null) {
+                .string => |s| s,
+                else => "",
+            };
+            try text_blocks.append(try arena.dupe(u8, text));
+        } else if (std.mem.eql(u8, type_str, "tool_use")) {
+            const id = switch (obj.get("id") orelse .null) {
+                .string => |s| s,
+                else => "",
+            };
+            const name = switch (obj.get("name") orelse .null) {
+                .string => |s| s,
+                else => "",
+            };
+            const input = obj.get("input") orelse .null;
+            try tool_calls.append(.{
+                .id = try arena.dupe(u8, id),
+                .name = try arena.dupe(u8, name),
                 .input = input,
             });
         }
     }
 
-    return .{ .text = text.items, .tool_calls = calls.items };
+    return .{
+        .text_blocks = try arena.dupe([]const u8, text_blocks.items),
+        .tool_calls = try arena.dupe(ResponseContent, tool_calls.items),
+    };
 }
 
-// ---- Conversation helpers ---------------------------------------------------
+// ---------------------------------------------------------------------------
+// Conversation helpers
+// ---------------------------------------------------------------------------
 
-fn pushUserText(conv: *Conversation, arena: std.mem.Allocator, text: []const u8) !void {
-    // Build a JSON content block: { "type": "text", "text": <text> }
-    var block_object: std.json.ObjectMap = .empty;
-    try block_object.put(arena, "type", std.json.Value{ .string = "text" });
-    try block_object.put(arena, "text", std.json.Value{ .string = text });
+const Conversation = std.ArrayListUnmanaged(MessageParam);
 
-    var content_array: std.json.Array = .init(arena);
-    try content_array.append(std.json.Value{ .object = block_object });
-
-    var msg_object: std.json.ObjectMap = .empty;
-    try msg_object.put(arena, "role", std.json.Value{ .string = "user" });
-    try msg_object.put(arena, "content", std.json.Value{ .array = content_array });
-
-    try conv.append(arena, std.json.Value{ .object = msg_object });
+fn pushUserText(c: *Conversation, gpa: std.mem.Allocator, arena: std.mem.Allocator, text: []const u8) !void {
+    const block = ContentBlockParam{ .text = .{ .text = try arena.dupe(u8, text) } };
+    const blocks = try arena.alloc(ContentBlockParam, 1);
+    blocks[0] = block;
+    try c.append(gpa, .{ .role = "user", .content = blocks });
 }
 
-fn pushAssistant(conv: *Conversation, arena: std.mem.Allocator, response: std.json.Value) !void {
-    var msg_object: std.json.ObjectMap = .empty;
-    try msg_object.put(arena, "role", std.json.Value{ .string = "assistant" });
-    const content = response.object.get("content") orelse std.json.Value.null;
-    try msg_object.put(arena, "content", content);
-    try conv.append(arena, std.json.Value{ .object = msg_object });
+fn pushAssistant(c: *Conversation, gpa: std.mem.Allocator, arena: std.mem.Allocator, response: ParsedResponse) !void {
+    // Build an assistant message containing the same content blocks we
+    // saw in the response. We need to round-trip both text and tool_use
+    // blocks for the next request so the model has full context.
+    const blocks = try arena.alloc(ContentBlockParam, response.text_blocks.len + response.tool_calls.len);
+    var i: usize = 0;
+    for (response.text_blocks) |t| {
+        blocks[i] = .{ .text = .{ .text = t } };
+        i += 1;
+    }
+    for (response.tool_calls) |tc| {
+        blocks[i] = .{ .tool_use = .{
+            .id = tc.id,
+            .name = tc.name,
+            .input = tc.input,
+        } };
+        i += 1;
+    }
+    try c.append(gpa, .{ .role = "assistant", .content = blocks });
 }
 
 fn pushToolResults(
-    conv: *Conversation,
+    c: *Conversation,
+    gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
-    calls: []const ToolCall,
-    results: []const ToolResult,
+    results: []const ContentBlockParam.ToolResultBlock,
 ) !void {
-    var blocks: std.json.Array = .init(arena);
-    for (calls, results) |call, result| {
-        var block_object: std.json.ObjectMap = .empty;
-        try block_object.put(arena, "type", std.json.Value{ .string = "tool_result" });
-        try block_object.put(arena, "tool_use_id", std.json.Value{ .string = call.id });
-        try block_object.put(arena, "content", std.json.Value{ .string = result.content });
-        try block_object.put(arena, "is_error", std.json.Value{ .bool = result.is_error });
-        try blocks.append(std.json.Value{ .object = block_object });
-    }
-
-    var msg_object: std.json.ObjectMap = .empty;
-    try msg_object.put(arena, "role", std.json.Value{ .string = "user" });
-    try msg_object.put(arena, "content", std.json.Value{ .array = blocks });
-
-    try conv.append(arena, std.json.Value{ .object = msg_object });
+    const blocks = try arena.alloc(ContentBlockParam, results.len);
+    for (results, 0..) |r, i| blocks[i] = .{ .tool_result = r };
+    try c.append(gpa, .{ .role = "user", .content = blocks });
 }
 
-const ToolResult = struct {
-    content: []const u8,
-    is_error: bool,
-};
+// ---------------------------------------------------------------------------
+// I/O helpers
+// ---------------------------------------------------------------------------
 
-// ---- Agent loop -------------------------------------------------------------
+fn printPrompt(io: Io, stdout: *Io.File) !void {
+    // Build the prompt at comptime so it goes out in a single
+    // `writeStreamingAll` call.
+    const prompt: []const u8 = c_you ++ "You" ++ c_reset ++ ": ";
+    try stdout.writeStreamingAll(io, prompt);
+}
+
+/// Read one line from stdin (without the trailing `\n`). Returns null on
+/// EOF or on read failure. Mirrors the Go version's `bufio.Scanner.Scan`
+/// behavior. The reader state lives in `*state`, so the underlying
+/// buffer survives between calls.
+fn readStdinLine(arena: std.mem.Allocator, _: Io, state: *Io.File.Reader) !?[]u8 {
+    const line_with_nl = state.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => {
+            // EOF: takeDelimiterInclusive returns EndOfStream when the
+            // stream ends without a delimiter. Return any buffered data
+            // as a partial line, otherwise null.
+            if (state.interface.bufferedLen() == 0) return null;
+            const remaining = state.interface.buffered();
+            return try arena.dupe(u8, remaining);
+        },
+        else => return err,
+    };
+    // `takeDelimiterInclusive` returns the delimiter as the last byte
+    // (see `Reader.takeDelimiterInclusive` and its unit test). Strip
+    // the trailing `\n` so callers get a clean line.
+    const line = line_with_nl[0 .. line_with_nl.len - 1];
+    // `takeDelimiterInclusive` returns a slice into the reader's internal
+    // buffer, which is invalidated by subsequent reads. Copy into the
+    // arena so the caller can use it after the reader is dropped.
+    return try arena.dupe(u8, line);
+}
+
+// ---------------------------------------------------------------------------
+// Agent loop
+// ---------------------------------------------------------------------------
 
 fn runAgent(
     arena: std.mem.Allocator,
-    stdin: std.posix.fd_t,
-    base_url: []const u8,
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: std.process.Environ,
     api_key: []const u8,
+    base_url: []const u8,
     model: []const u8,
 ) !void {
-    var conv = Conversation{};
+    // The HTTP client needs a `now` timestamp for TLS certificate
+    // validation (see http/Client.zig). The lazy init only loads the
+    // CA bundle once `now` is set, so this is a one-time setup.
+    var client: std.http.Client = .{
+        .allocator = gpa,
+        .io = io,
+        .now = Io.Clock.real.now(io),
+    };
+    defer client.deinit();
+
+    // TLS requires a CA bundle. Zig 0.16 does not auto-load one
+    // (unlike curl/Go), so we point the client at the system bundle.
+    // `ca_bundle.rescan` knows the right location for each supported
+    // platform (Linux, macOS, Windows, BSDs). When the user has set
+    // `SSL_CERT_FILE`, fall back to loading that specific file
+    // (matches curl/Go conventions). Either way, errors are
+    // non-fatal: the request will surface `TlsInitializationFailed`
+    // if the bundle really is missing, and that already gives a
+    // useful diagnostic.
+    {
+        const ca_path = getEnvOr(environ, "SSL_CERT_FILE", "");
+        const now_ts = client.now orelse Io.Clock.real.now(io);
+        if (ca_path.len > 0) {
+            client.ca_bundle.addCertsFromFilePathAbsolute(gpa, io, now_ts, ca_path) catch |err| {
+                std.log.warn("failed to load CA bundle from {s}: {t}", .{ ca_path, err });
+            };
+        } else {
+            client.ca_bundle.rescan(gpa, io, now_ts) catch |err| {
+                std.log.warn("failed to rescan CA bundle: {t}", .{err});
+            };
+        }
+    }
+
+    // The auth header is a single `Header` on the stack. The
+    // `client.request` call takes a slice of headers and copies the
+    // values internally for the duration of the request, so the stack
+    // lifetime is sufficient.
+    //
+    // Note: `accept-encoding` is a privileged header and is set via the
+    // structured `RequestOptions.headers` field (see `sendMessage`),
+    // not here.
+    const extra_headers: []const std.http.Header = &.{
+        .{ .name = "x-api-key", .value = api_key },
+        .{ .name = "anthropic-version", .value = "2023-06-01" },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+
+    var stdin_file = Io.File.stdin();
+    var stdout_file = Io.File.stdout();
+    const stdin = &stdin_file;
+    const stdout = &stdout_file;
+
+    try stdout.writeStreamingAll(io, "Chat with AI (use 'ctrl-c' to quit)\n");
+
+    // Create the stdin reader once and keep it alive for the whole
+    // session — the reader's internal buffer must persist across
+    // `readStdinLine` calls so leftover data after a delimiter isn't
+    // lost.
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader = stdin.reader(io, &stdin_buf);
+
+    var conversation: Conversation = .empty;
+    defer conversation.deinit(gpa);
+
+    // Build the "AI: " and "tool: " prefixes at comptime so each
+    // per-turn print is a single `writeStreamingAll` call.
+    const ai_prefix: []const u8 = c_ai ++ "AI" ++ c_reset ++ ": ";
+    const tool_prefix: []const u8 = c_tool ++ "tool" ++ c_reset ++ ": ";
+
     var read_user_input = true;
-
-    try writeAll(stdout_fd, "Chat with AI (use 'ctrl-c' to quit)\n");
-
     while (true) {
+        var user_text: ?[]u8 = null;
         if (read_user_input) {
-            try writeAll(stdout_fd, c_you ++ "You" ++ c_reset ++ ": ");
-            const line = try readLineAlloc(arena, stdin);
-            if (line == null) break;
-            if (line.?.len == 0) continue; // empty prompt: do nothing, re-prompt
-            try pushUserText(&conv, arena, line.?);
+            try printPrompt(io, stdout);
+
+            // The Go version sends an empty user message if the user
+            // submits an empty line. The plan instead says to re-prompt.
+            // We follow the plan: re-prompt on empty input, but still
+            // break the loop on EOF.
+            while (true) {
+                user_text = try readStdinLine(arena, io, &stdin_reader);
+                if (user_text == null) break; // EOF
+                if (user_text.?.len == 0) {
+                    try printPrompt(io, stdout);
+                    continue;
+                }
+                break;
+            }
+            if (user_text == null) break; // EOF
+            try pushUserText(&conversation, gpa, arena, user_text.?);
         }
 
-        const parsed = sendMessage(arena, base_url, api_key, model, &conv) catch |err| {
-            try printFd(stderr_fd, "Error: {s}\n", .{@errorName(err)});
-            return;
+        const body_bytes = try buildRequestBody(arena, model, conversation.items, tools);
+        const raw = sendMessage(arena, &client, extra_headers, base_url, body_bytes) catch |err| {
+            std.log.err("API request failed: {t}", .{err});
+            return err;
         };
-        defer parsed.deinit();
-        const response = parsed.value;
+        const parsed = try handleResponse(arena, raw);
 
-        const turn = try handleResponse(arena, response);
-        if (turn.text.len != 0) {
-            try writeAll(stdout_fd, c_ai ++ "AI" ++ c_reset ++ ": ");
-            try writeAll(stdout_fd, turn.text);
+        // Print any text blocks (matches Go's `case "text"` branch).
+        for (parsed.text_blocks) |t| {
+            try stdout.writeStreamingAll(io, ai_prefix);
+            try stdout.writeStreamingAll(io, t);
+            try stdout.writeStreamingAll(io, "\n");
         }
 
-        try pushAssistant(&conv, arena, response);
+        try pushAssistant(&conversation, gpa, arena, parsed);
 
-        if (turn.tool_calls.len == 0) {
+        if (parsed.tool_calls.len == 0) {
+            // No tool calls: the model is done with this turn. Go back
+            // to the prompt.
             read_user_input = true;
             continue;
         }
 
+        // Execute each tool, build tool_result blocks, push as a user
+        // message, and loop without re-prompting. Mirrors the Go
+        // version's `toolResults` accumulation.
+        var results: std.array_list.Managed(ContentBlockParam.ToolResultBlock) = std.array_list.Managed(ContentBlockParam.ToolResultBlock).init(std.heap.page_allocator);
+        defer results.deinit();
+
+        for (parsed.tool_calls) |tc| {
+            try stdout.writeStreamingAll(io, tool_prefix);
+            try stdout.writeStreamingAll(io, tc.name);
+            try stdout.writeStreamingAll(io, "(");
+
+            // Best-effort pretty-print of the tool's input. We use
+            // `valueAlloc` which returns a fresh `[]u8` slice (this is
+            // the only `Stringify` API that still hides the writer
+            // plumbing in 0.16). If the stringify fails, fall back to
+            // an empty string and skip the free — `Allocator.free` of a
+            // zero-length slice is a no-op, but we don't want to
+            // pretend we own a string literal.
+            const input_str = std.json.Stringify.valueAlloc(std.heap.page_allocator, tc.input, .{}) catch &.{};
+            defer std.heap.page_allocator.free(input_str);
+            try stdout.writeStreamingAll(io, input_str);
+            try stdout.writeStreamingAll(io, ")\n");
+
+            const tool = findTool(tc.name) orelse {
+                try results.append(.{
+                    .tool_use_id = tc.id,
+                    .content = "tool not found",
+                    .is_error = true,
+                });
+                continue;
+            };
+            const result_str = tool.func(tc.input, arena, io) catch |err| {
+                const err_msg = std.fmt.allocPrint(arena, "{s}", .{@errorName(err)}) catch "error";
+                try results.append(.{
+                    .tool_use_id = tc.id,
+                    .content = err_msg,
+                    .is_error = true,
+                });
+                continue;
+            };
+            try results.append(.{
+                .tool_use_id = tc.id,
+                .content = result_str,
+                .is_error = false,
+            });
+        }
+
+        try pushToolResults(&conversation, gpa, arena, results.items);
         read_user_input = false;
-        const results = try arena.alloc(ToolResult, turn.tool_calls.len);
-        for (turn.tool_calls, results) |call, *slot| {
-            if (findTool(call.name)) |tool| {
-                // Print the tool call to the user.
-                const input_str = try std.json.stringifyAlloc(arena, call.input, .{});
-                try printFd(stdout_fd, c_tool ++ "tool" ++ c_reset ++ ": {s}({s})\n", .{ call.name, input_str });
-                if (tool.func(call.input, arena)) |out| {
-                    slot.* = .{ .content = out, .is_error = false };
-                } else |err| {
-                    slot.* = .{ .content = @errorName(err), .is_error = true };
-                }
-            } else {
-                slot.* = .{ .content = "tool not found", .is_error = true };
-            }
-        }
-        try pushToolResults(&conv, arena, turn.tool_calls, results);
     }
 }
 
-/// Reads one line from `fd` (delimited by '\n' or EOF). Returns null on EOF.
-/// The returned slice is owned by `arena`.
-fn readLineAlloc(arena: std.mem.Allocator, fd: std.posix.fd_t) !?[]u8 {
-    var buf: std.array_list.Aligned(u8, null) = .empty;
-    var one: [1]u8 = undefined;
-    while (true) {
-        const n = read(fd, &one, 1);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) {
-            if (buf.items.len == 0) return null;
-            return buf.items;
-        }
-        if (one[0] == '\n') return buf.items;
-        try buf.append(arena, one[0]);
-    }
-}
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
-// ---- main -------------------------------------------------------------------
+pub fn main(init: std.process.Init.Minimal) void {
+    // In Zig 0.16 every FS op needs an `io: std.Io` parameter. The
+    // `std.Io.Threaded` model is the right fit for a CLI tool that does
+    // both stdin/stdout and network I/O. See README.md for the full
+    // list of call sites that had to change.
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    const gpa_allocator = gpa.allocator();
+    // The http.Client needs a real heap-backed allocator for its
+    // connection pool; `std.heap.page_allocator` is fine for a CLI of
+    // this size. (For Debug leak detection, swap in `std.heap.DebugAllocator`.)
+    const gpa = std.heap.page_allocator;
 
-    var arena: std.heap.ArenaAllocator = .init(gpa_allocator);
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    // `c.getenv` returns a `?[*c]u8` (a nullable C many-pointer). A
-    // `[*c]u8` has no `.len` field, so we must convert it to a `[]const u8`
-    // slice (via `std.mem.span`) before we can check its length. The null
-    // case is handled with a plain `if` statement rather than `orelse { ... }`
-    // to sidestep any block-type-inference quirks in Zig 0.16.
-    const api_key_ptr = c.getenv("API_KEY");
-    if (api_key_ptr == null) {
-        try writeAll(stderr_fd, "Error: API_KEY environment variable is not set\n");
-        std.process.exit(1);
-    }
-    const api_key = std.mem.span(api_key_ptr.?);
+    // Pull config from env. `API_KEY` is required; the others fall
+    // back to defaults (see top of file). We exit(1) on missing/empty
+    // API key, mirroring the Go version (which prints an error and
+    // recovers).
+    //
+    // `std.process.Environ.getPosix` walks the env block captured at
+    // startup. `std.c.getenv` (libc) does NOT work under Zig 0.16's
+    // standalone runtime because it doesn't populate libc's
+    // `environ` global — see `std/start.zig`.
+    const api_key = getEnvOr(init.environ, "API_KEY", "");
     if (api_key.len == 0) {
-        try writeAll(stderr_fd, "Error: API_KEY environment variable is empty\n");
+        const stderr = Io.File.stderr();
+        stderr.writeStreamingAll(io, "Error: API_KEY environment variable is required.\n") catch {};
         std.process.exit(1);
     }
 
-    const base_url = try getEnvOr(arena_alloc, "ANTHROPIC_BASE_URL", "https://opencode.ai/zen/go");
-    const model = try getEnvOr(arena_alloc, "MODEL", "minimax-m3");
+    const base_url = getEnvOr(init.environ, "ANTHROPIC_BASE_URL", default_base_url);
+    const model = getEnvOr(init.environ, "MODEL", default_model);
 
-    try runAgent(
-        arena_alloc,
-        stdin_fd,
-        base_url,
-        api_key,
-        model,
-    );
+    runAgent(arena_alloc, gpa, io, init.environ, api_key, base_url, model) catch |err| {
+        const stderr = Io.File.stderr();
+        const msg = std.fmt.allocPrint(arena_alloc, "Error: {s}\n", .{@errorName(err)}) catch "Error: <unknown>\n";
+        stderr.writeStreamingAll(io, msg) catch {};
+    };
 }
