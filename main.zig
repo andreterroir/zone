@@ -868,7 +868,18 @@ pub fn main(init: std.process.Init.Minimal) void {
     // `std.Io.Threaded` model is the right fit for a CLI tool that does
     // both stdin/stdout and network I/O. See README.md for the full
     // list of call sites that had to change.
-    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    //
+    // We pass `init.environ` (the env block captured by the runtime at
+    // startup) into the Io instance. Without this, `InitOptions.environ`
+    // defaults to `.empty`, and `std.process.run` will spawn child
+    // processes with an *empty* environment — `/bin/bash` then falls
+    // back to its compiled-in default `PATH`
+    // (`/usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:`) instead of
+    // inheriting the parent's `$PATH`. This was the root cause of the
+    // "PATH reported by bash tool looks wrong" bug; the Go version
+    // inherits the parent env automatically because Go's
+    // `exec.Command` does so by default.
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = init.environ });
     defer threaded.deinit();
     const io = threaded.io();
 
