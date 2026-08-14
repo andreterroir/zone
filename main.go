@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -73,15 +74,23 @@ func (a *Agent) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		conversation = append(conversation, message.ToParam())
+		conversation = append(conversation, message)
 
 		toolResults := []anthropic.ContentBlockParamUnion{}
 		for _, content := range message.Content {
-			switch content.Type {
-			case "text":
-				fmt.Printf("\u001b[93mAI\u001b[0m: %s\n", content.Text)
-			case "tool_use":
-				result := a.executeTool(content.ID, content.Name, content.Input)
+			switch {
+			case content.OfText != nil:
+				// Streaming has already printed the text and a trailing
+				// newline in `runInference`. Nothing to do here.
+				_ = content.OfText.Text
+			case content.OfToolUse != nil:
+				tu := content.OfToolUse
+				// `ToolUseBlockParam.Input` is typed `any`; in
+				// `runInference` we always store a `json.RawMessage`
+				// (the buffered concatenation of `input_json_delta`
+				// fragments), so this assertion is guaranteed to hold.
+				input, _ := tu.Input.(json.RawMessage)
+				result := a.executeTool(tu.ID, tu.Name, input)
 				toolResults = append(toolResults, result)
 			}
 		}
@@ -118,7 +127,7 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 	return anthropic.NewToolResultBlock(id, response, false)
 }
 
-func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
+func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (anthropic.MessageParam, error) {
 	anthropicTools := []anthropic.ToolUnionParam{}
 	for _, tool := range a.tools {
 		anthropicTools = append(anthropicTools, anthropic.ToolUnionParam{
@@ -129,15 +138,136 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 			},
 		})
 	}
-	// the Anthropic API automatically includes system instructions for tool use
-	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
 
+	// Open the stream. The SDK already appends `stream: true` internally
+	// (see message.go:NewStreaming).
+	stream := a.client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
 		Model:     "minimax-m3",
 		MaxTokens: 10000,
 		Messages:  conversation,
 		Tools:     anthropicTools,
 	})
-	return message, err
+	defer stream.Close()
+
+	// We assemble an `anthropic.MessageParam` directly from the stream
+	// instead of building a `Message` and calling `.ToParam()`. Two
+	// reasons:
+	//   1. `ContentBlockUnion` (the response shape) is a flat struct with
+	//      no exported `Of*` accessors; mutating its `Text` field directly
+	//      works, but `AsText()`/`AsToolUse()` round-trip through the
+	//      fixed `JSON.raw` snapshot and discard streamed edits.
+	//   2. `MessageParam`'s `Content` is already a `[]ContentBlockParamUnion`
+	//      with tagged-pointer `OfText`/`OfToolUse` fields — which is
+	//      exactly what the `Run` loop in this file iterates, and what
+	//      the next request round-trips as conversation history.
+	var blocks []anthropic.ContentBlockParamUnion
+
+	// For tool_use blocks, the streamed `input_json_delta` events carry
+	// partial JSON fragments. We buffer them per-block-index and
+	// materialize a single `json.RawMessage` at `content_block_stop`.
+	type toolBuilder struct {
+		id, name string
+		inputBuf bytes.Buffer
+	}
+	builders := map[int64]*toolBuilder{}
+
+	// Track whether we've printed the "AI: " prefix yet for this turn so
+	// that streamed text appears as one continuous line ("AI: hello there")
+	// instead of being prefixed on every delta.
+	aiPrefixPrinted := false
+	printAIPrefix := func() {
+		if aiPrefixPrinted {
+			return
+		}
+		os.Stdout.Write([]byte("\x1b[93mAI\x1b[0m: "))
+		aiPrefixPrinted = true
+	}
+
+	for stream.Next() {
+		ev := stream.Current()
+		switch ev.Type {
+		case "message_start":
+			// Nothing to capture — `message_start.Message` is the response
+			// shape; we don't need its fields here. Stop reason lands in
+			// `message_delta` and isn't surfaced to the conversation.
+			_ = ev.Message
+		case "content_block_start":
+			idx := ev.Index
+			cb := ev.ContentBlock
+			switch cb.Type {
+			case "text":
+				blocks = append(blocks, anthropic.ContentBlockParamUnion{
+					OfText: &anthropic.TextBlockParam{Type: "text", Text: ""},
+				})
+			case "tool_use":
+				tb := &toolBuilder{id: cb.ID, name: cb.Name}
+				builders[idx] = tb
+				blocks = append(blocks, anthropic.ContentBlockParamUnion{
+					OfToolUse: &anthropic.ToolUseBlockParam{
+						Type: "tool_use",
+						ID:   tb.id,
+						Name: tb.name,
+						// Input is filled in at content_block_stop from tb.inputBuf.
+					},
+				})
+			}
+		case "content_block_delta":
+			idx := ev.Index
+			// Defensive: skip deltas that arrive before their block does.
+			if int(idx) >= len(blocks) {
+				continue
+			}
+			switch ev.Delta.Type {
+			case "text_delta":
+				printAIPrefix()
+				t := ev.Delta.Text
+				os.Stdout.Write([]byte(t))
+				if tp := blocks[idx].OfText; tp != nil {
+					tp.Text += t
+				}
+			case "input_json_delta":
+				if tb, ok := builders[idx]; ok {
+					tb.inputBuf.WriteString(ev.Delta.PartialJSON)
+				}
+			}
+		case "content_block_stop":
+			idx := ev.Index
+			if int(idx) >= len(blocks) {
+				continue
+			}
+			if tub, ok := builders[idx]; ok {
+				if tup := blocks[idx].OfToolUse; tup != nil {
+					tup.Input = json.RawMessage(tub.inputBuf.Bytes())
+				}
+			}
+		case "message_delta":
+			// Carries stop_reason and cumulative usage. Nothing in this
+			// agent surfaces those, but we consume the event so the loop
+			// stays symmetric with the wire protocol.
+			_ = ev.Delta
+			_ = ev.Usage
+		case "message_stop":
+			// Final event; loop terminates on the next Next().
+		}
+	}
+
+	if err := stream.Err(); err != nil {
+		return anthropic.MessageParam{}, err
+	}
+
+	// If any text streamed this turn, terminate with a newline so the next
+	// `You:` prompt lands on its own line. (Non-streaming printed `\n`
+	// once per text block; streaming prints once at end-of-text.) If only
+	// tool_use blocks came back, we still want a newline so any
+	// `tool: ...` lines that follow aren't glued to a prior prompt.
+	if aiPrefixPrinted {
+		os.Stdout.Write([]byte("\n"))
+	}
+
+	return anthropic.MessageParam{
+		Role:    anthropic.MessageParamRoleAssistant,
+		Content: blocks,
+	}, nil
 }
 
 type ToolDefinition struct {

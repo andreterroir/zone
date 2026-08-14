@@ -65,6 +65,7 @@ These are intentional, documented in `main.zig` at the call sites:
 | Tool input parsing strictness | Go's `json.Unmarshal` ignores unknown fields | `parseFromValueLeaky(..., .{ .ignore_unknown_fields = true })` — same as Go |
 | Bash signal exit code | `-1` (Go's `cmd.ProcessState.ExitCode()`) | `-1` (matching Go for parity) |
 | `bash` `duration_ms` | `time.Since(start).Milliseconds()` | `Io.Clock.awake` start/end `Timestamp.durationTo` / `ns_per_ms` (matching Go) |
+| Streaming | Yes — `client.Messages.NewStreaming` (SSE). Text tokens print to stdout as they arrive; tool-use blocks are accumulated and only dispatched after `content_block_stop`. `MessageParam` is built directly from stream events (no `Message.ToParam()` round-trip). | No — `sendMessage` buffers the full response body (capped at 1 MiB) before parsing. |
 
 ## Zig 0.16.0 notes
 
@@ -101,7 +102,6 @@ A few std-lib quirks that the rewrite has to work around (call sites in
 
 ## Out of scope (neither implementation)
 
-- No streaming.
 - No conversation history truncation / token counting.
 - No retry / backoff.
 - No multi-provider support (OpenAI etc.).
