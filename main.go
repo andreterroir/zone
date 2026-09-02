@@ -160,6 +160,13 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 	//      with tagged-pointer `OfText`/`OfToolUse` fields — which is
 	//      exactly what the `Run` loop in this file iterates, and what
 	//      the next request round-trips as conversation history.
+	// NOTE: Currently we defer all tool execution until after the
+	// full stream returns. An optimization would be to execute each
+	// tool as soon as its content_block_stop arrives (i.e., when the
+	// tool_use input is fully assembled). This would reduce latency
+	// for independent tool calls, but requires careful handling of
+	// inter-dependent tool chains and partial response error
+	// recovery.
 	var blocks []anthropic.ContentBlockParamUnion
 
 	// For tool_use blocks, the streamed `input_json_delta` events carry
