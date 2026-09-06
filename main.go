@@ -14,12 +14,24 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/invopop/jsonschema"
 )
 
-func main() {
-	client := anthropic.NewClient()
+const defaultBaseURL = "https://opencode.ai/zen/go"
 
+func main() {
+	// Default to the OpenCode Zen Go endpoint when ANTHROPIC_BASE_URL
+	// is unset; otherwise let the user's value win.
+	var opts []option.RequestOption
+	if _, ok := os.LookupEnv("ANTHROPIC_BASE_URL"); !ok {
+		opts = []option.RequestOption{option.WithBaseURL(defaultBaseURL)}
+	}
+	client := anthropic.NewClient(opts...)
+	runAgent(&client)
+}
+
+func runAgent(client *anthropic.Client) {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	getUserMessage := func() (string, bool) {
@@ -30,7 +42,7 @@ func main() {
 	}
 
 	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, BashDefinition}
-	agent := NewAgent(&client, getUserMessage, tools)
+	agent := NewAgent(client, getUserMessage, tools)
 	err := agent.Run(context.TODO()) // context for cancellation/timeout control
 	if err != nil {
 		fmt.Printf("Error: %s\n", err.Error())

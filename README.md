@@ -21,6 +21,9 @@ OpenCode Go endpoints are documented
 The default endpoint is the OpenCode Zen Go Anthropic-compatible endpoint,
 and the default model is `minimax-m3`. Both are overridable via env vars.
 
+`ANTHROPIC_BASE_URL` defaults to the OpenCode Zen Go endpoint when
+unset; a user-supplied value overrides it.
+
 | Env var | Required | Default |
 |---|---|---|
 | `ANTHROPIC_BASE_URL` | no | `https://opencode.ai/zen/go` |
