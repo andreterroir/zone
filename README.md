@@ -16,6 +16,21 @@ ANTHROPIC_BASE_URL='https://opencode.ai/zen/go' ANTHROPIC_API_KEY='<redacted>' g
 OpenCode Go endpoints are documented
 [here](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/go.mdx#endpoints).
 
+### Initial prompt
+
+Anything after the (currently empty) flags is joined with spaces and sent
+as the first user message — useful for one-shot scripted invocations.
+After that turn the agent falls back to the interactive stdin REPL.
+
+```sh
+# Equivalent to typing "summarize this repo" at the first You: prompt,
+# then continuing the conversation interactively.
+go run main.go summarize this repo
+```
+
+Flag parsing uses the stdlib `flag` package, so adding `-f` / `--long-flag`
+later is a drop-in change.
+
 ## Configuration
 
 The default endpoint is the OpenCode Zen Go Anthropic-compatible endpoint,

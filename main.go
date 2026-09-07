@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -22,6 +23,16 @@ import (
 const defaultBaseURL = "https://opencode.ai/zen/go"
 
 func main() {
+	// Parse flags. Any positional args after the flags form the free-form
+	// initial prompt, joined with spaces. Currently no flags are defined,
+	// but `flag.CommandLine` keeps that contract stable so introducing
+	// `-f` / `--long-flag` later is a one-line addition. ExitOnError so
+	// unknown flags print usage and exit non-zero rather than silently
+	// being absorbed into the initial prompt.
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	flag.Parse()
+	initialPrompt := strings.Join(flag.Args(), " ")
+
 	// Default to the OpenCode Zen Go endpoint when ANTHROPIC_BASE_URL
 	// is unset; otherwise let the user's value win.
 	opts := []option.RequestOption{option.WithHeader("x-opencode-session", strconv.FormatInt(time.Now().UnixNano(), 10))}
@@ -29,10 +40,10 @@ func main() {
 		opts = append(opts, option.WithBaseURL(defaultBaseURL))
 	}
 	client := anthropic.NewClient(opts...)
-	runAgent(&client)
+	runAgent(&client, initialPrompt)
 }
 
-func runAgent(client *anthropic.Client) {
+func runAgent(client *anthropic.Client, initialPrompt string) {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	getUserMessage := func() (string, bool) {
@@ -43,7 +54,7 @@ func runAgent(client *anthropic.Client) {
 	}
 
 	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, BashDefinition}
-	agent := NewAgent(client, getUserMessage, tools)
+	agent := NewAgent(client, getUserMessage, tools, initialPrompt)
 	err := agent.Run(context.TODO()) // context for cancellation/timeout control
 	if err != nil {
 		fmt.Printf("Error: %s\n", err.Error())
@@ -51,11 +62,12 @@ func runAgent(client *anthropic.Client) {
 }
 
 func NewAgent(client *anthropic.Client, getUserMessage func() (string, bool),
-	tools []ToolDefinition) *Agent {
+	tools []ToolDefinition, initialPrompt string) *Agent {
 	return &Agent{
 		client:         client,
 		getUserMessage: getUserMessage,
 		tools:          tools,
+		initialPrompt:  initialPrompt,
 	}
 }
 
@@ -63,6 +75,7 @@ type Agent struct {
 	client         *anthropic.Client
 	getUserMessage func() (string, bool)
 	tools          []ToolDefinition
+	initialPrompt  string
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -70,7 +83,16 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	fmt.Println("Chat with AI (use 'ctrl-c' to quit)")
 
-	readUserInput := true
+	// If an initial prompt was supplied on the command line, seed the
+	// conversation with it and skip the first stdin prompt. After that
+	// turn the loop falls back to the normal interactive flow.
+	readUserInput := a.initialPrompt == ""
+	if !readUserInput {
+		fmt.Printf("\u001b[94mYou\u001b[0m: %s\n", a.initialPrompt)
+		conversation = append(conversation,
+			anthropic.NewUserMessage(anthropic.NewTextBlock(a.initialPrompt)))
+	}
+
 	for {
 		if readUserInput {
 			fmt.Print("\u001b[94mYou\u001b[0m: ")
