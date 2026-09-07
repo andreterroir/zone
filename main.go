@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"os/exec"
 	"path"
 	"path/filepath"
@@ -23,9 +24,9 @@ const defaultBaseURL = "https://opencode.ai/zen/go"
 func main() {
 	// Default to the OpenCode Zen Go endpoint when ANTHROPIC_BASE_URL
 	// is unset; otherwise let the user's value win.
-	var opts []option.RequestOption
+	opts := []option.RequestOption{option.WithHeader("x-opencode-session", strconv.FormatInt(time.Now().UnixNano(), 10))}
 	if _, ok := os.LookupEnv("ANTHROPIC_BASE_URL"); !ok {
-		opts = []option.RequestOption{option.WithBaseURL(defaultBaseURL)}
+		opts = append(opts, option.WithBaseURL(defaultBaseURL))
 	}
 	client := anthropic.NewClient(opts...)
 	runAgent(&client)
