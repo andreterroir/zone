@@ -24,6 +24,34 @@ const defaultBaseURL = "https://opencode.ai/zen/go"
 
 const systemPrompt = "You are a coding agent - start from exploring the current directory"
 
+// User-global AGENTS.md (Claude Code / friends use this path by convention).
+const globalAgentsPath = "/home/andrew/.agents/AGENTS.md"
+
+// Sibling the global AGENTS.md instructs the agent to also read.
+const globalAgentsLocalPath = "/home/andrew/.agents/AGENTS.local.md"
+
+// loadSystemPrompt returns: base prompt, then AGENTS.md (if readable)
+// under "# Agent Instructions", then AGENTS.local.md (if readable)
+// under "# Machine Specific Agent Instructions". Missing files are
+// silently skipped.
+func loadSystemPrompt() []anthropic.TextBlockParam {
+	blocks := []anthropic.TextBlockParam{{Text: systemPrompt}}
+
+	if content, err := os.ReadFile(globalAgentsPath); err == nil {
+		blocks = append(blocks, anthropic.TextBlockParam{
+			Text: "# Agent Instructions\n\n" + string(content),
+		})
+	}
+
+	if content, err := os.ReadFile(globalAgentsLocalPath); err == nil {
+		blocks = append(blocks, anthropic.TextBlockParam{
+			Text: "# Machine Specific Agent Instructions\n\n" + string(content),
+		})
+	}
+
+	return blocks
+}
+
 func main() {
 	// Parse flags against a local FlagSet so we don't mutate the global
 	// `flag.CommandLine`. Any positional args after the flags form the
@@ -188,11 +216,9 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 	stream := a.client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
 		Model:     "minimax-m3",
 		MaxTokens: 10000,
-		System: []anthropic.TextBlockParam{
-			{Text: systemPrompt},
-		},
-		Messages: conversation,
-		Tools:    anthropicTools,
+		System:    loadSystemPrompt(),
+		Messages:  conversation,
+		Tools:     anthropicTools,
 	})
 	defer stream.Close()
 

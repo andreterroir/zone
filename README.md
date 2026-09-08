@@ -46,6 +46,14 @@ unset; a user-supplied value overrides it.
 
 The default model is `minimax-m3`, hard-coded in `main.go`.
 
+## System prompt
+
+Every turn's system prompt is: `systemPrompt`, then
+`/home/andrew/.agents/AGENTS.md` (if readable) under
+`# Agent Instructions`, then `/home/andrew/.agents/AGENTS.local.md`
+(if readable) under `# Machine Specific Agent Instructions`. Missing
+files are skipped silently.
+
 ## Streaming
 
 The Go implementation uses `client.Messages.NewStreaming` (SSE). Text
