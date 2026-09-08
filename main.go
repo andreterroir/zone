@@ -22,7 +22,7 @@ import (
 
 const defaultBaseURL = "https://opencode.ai/zen/go"
 
-const systemPrompt = "You are a coding agent - start from exploring the current directory"
+const systemPrompt = "You are a coding agent named zone - start from exploring the current directory"
 
 // User-global AGENTS.md (Claude Code / friends use this path by convention).
 const globalAgentsPath = "/home/andrew/.agents/AGENTS.md"
