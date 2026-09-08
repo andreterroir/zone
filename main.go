@@ -23,15 +23,21 @@ import (
 const defaultBaseURL = "https://opencode.ai/zen/go"
 
 func main() {
-	// Parse flags. Any positional args after the flags form the free-form
-	// initial prompt, joined with spaces. Currently no flags are defined,
-	// but `flag.CommandLine` keeps that contract stable so introducing
-	// `-f` / `--long-flag` later is a one-line addition. ExitOnError so
-	// unknown flags print usage and exit non-zero rather than silently
-	// being absorbed into the initial prompt.
-	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	flag.Parse()
-	initialPrompt := strings.Join(flag.Args(), " ")
+	// Parse flags against a local FlagSet so we don't mutate the global
+	// `flag.CommandLine`. Any positional args after the flags form the
+	// free-form initial prompt, joined with spaces. ExitOnError ensures
+	// unknown flags print usage and exit non-zero rather than being
+	// silently absorbed into the initial prompt. Defining flags here
+	// (e.g. `fs.StringVar(...)`) is the only change needed when adding
+	// `-f` / `--long-flag` later.
+	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	fs.Parse(os.Args[1:])
+	// Whitespace-only arguments (e.g. a stray trailing space that survived
+	// shell tokenization) collapse to the empty string here, so they're
+	// treated identically to "no initial prompt supplied" — i.e. the
+	// loop falls back to interactive stdin rather than sending a
+	// whitespace-only first turn.
+	initialPrompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
 
 	// Default to the OpenCode Zen Go endpoint when ANTHROPIC_BASE_URL
 	// is unset; otherwise let the user's value win.
@@ -86,11 +92,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	// If an initial prompt was supplied on the command line, seed the
 	// conversation with it and skip the first stdin prompt. After that
 	// turn the loop falls back to the normal interactive flow.
-	readUserInput := a.initialPrompt == ""
-	if !readUserInput {
+	readUserInput := true
+	if a.initialPrompt != "" {
 		fmt.Printf("\u001b[94mYou\u001b[0m: %s\n", a.initialPrompt)
 		conversation = append(conversation,
 			anthropic.NewUserMessage(anthropic.NewTextBlock(a.initialPrompt)))
+		readUserInput = false
 	}
 
 	for {
