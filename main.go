@@ -30,10 +30,9 @@ const globalAgentsPath = "/home/andrew/.agents/AGENTS.md"
 // Sibling the global AGENTS.md instructs the agent to also read.
 const globalAgentsLocalPath = "/home/andrew/.agents/AGENTS.local.md"
 
-// loadSystemPrompt returns: base prompt, then AGENTS.md (if readable)
-// under "# Agent Instructions", then AGENTS.local.md (if readable)
-// under "# Machine Specific Agent Instructions". Missing files are
-// silently skipped.
+// loadSystemPrompt returns the base prompt, then AGENTS.md under
+// "# Agent Instructions", then AGENTS.local.md under
+// "# Machine Specific Agent Instructions". Unreadable files are skipped.
 func loadSystemPrompt() []anthropic.TextBlockParam {
 	blocks := []anthropic.TextBlockParam{{Text: systemPrompt}}
 
@@ -53,24 +52,10 @@ func loadSystemPrompt() []anthropic.TextBlockParam {
 }
 
 func main() {
-	// Parse flags against a local FlagSet so we don't mutate the global
-	// `flag.CommandLine`. Any positional args after the flags form the
-	// free-form initial prompt, joined with spaces. ExitOnError ensures
-	// unknown flags print usage and exit non-zero rather than being
-	// silently absorbed into the initial prompt. Defining flags here
-	// (e.g. `fs.StringVar(...)`) is the only change needed when adding
-	// `-f` / `--long-flag` later.
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	fs.Parse(os.Args[1:])
-	// Whitespace-only arguments (e.g. a stray trailing space that survived
-	// shell tokenization) collapse to the empty string here, so they're
-	// treated identically to "no initial prompt supplied" — i.e. the
-	// loop falls back to interactive stdin rather than sending a
-	// whitespace-only first turn.
 	initialPrompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
 
-	// Default to the OpenCode Zen Go endpoint when ANTHROPIC_BASE_URL
-	// is unset; otherwise let the user's value win.
 	opts := []option.RequestOption{option.WithHeader("x-opencode-session", strconv.FormatInt(time.Now().UnixNano(), 10)), option.WithHeader("User-Agent", "zone/0.1")}
 	if _, ok := os.LookupEnv("ANTHROPIC_BASE_URL"); !ok {
 		opts = append(opts, option.WithBaseURL(defaultBaseURL))
@@ -91,7 +76,7 @@ func runAgent(client *anthropic.Client, initialPrompt string) {
 
 	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, BashDefinition}
 	agent := NewAgent(client, getUserMessage, tools, initialPrompt)
-	err := agent.Run(context.TODO()) // context for cancellation/timeout control
+	err := agent.Run(context.TODO())
 	if err != nil {
 		fmt.Printf("Error: %s\n", err.Error())
 	}
@@ -119,11 +104,9 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	fmt.Println("Chat with AI (use 'ctrl-c' to quit)")
 
-	// If an initial prompt was supplied on the command line, seed the
-	// conversation with it and skip the first stdin prompt. After that
-	// turn the loop falls back to the normal interactive flow.
 	readUserInput := true
 	if a.initialPrompt != "" {
+		// Subsequent turns fall back to interactive stdin.
 		fmt.Printf("\u001b[94mYou\u001b[0m: %s\n", a.initialPrompt)
 		conversation = append(conversation,
 			anthropic.NewUserMessage(anthropic.NewTextBlock(a.initialPrompt)))
@@ -152,15 +135,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		for _, content := range message.Content {
 			switch {
 			case content.OfText != nil:
-				// Streaming has already printed the text and a trailing
-				// newline in `runInference`. Nothing to do here.
+				// Text was already streamed and newline-terminated in runInference.
 				_ = content.OfText.Text
 			case content.OfToolUse != nil:
 				tu := content.OfToolUse
-				// `ToolUseBlockParam.Input` is typed `any`; in
-				// `runInference` we always store a `json.RawMessage`
-				// (the buffered concatenation of `input_json_delta`
-				// fragments), so this assertion is guaranteed to hold.
+				// runInference always stores a json.RawMessage here.
 				input, _ := tu.Input.(json.RawMessage)
 				result := a.executeTool(tu.ID, tu.Name, input)
 				toolResults = append(toolResults, result)
@@ -211,8 +190,7 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 		})
 	}
 
-	// Open the stream. The SDK already appends `stream: true` internally
-	// (see message.go:NewStreaming).
+	// SDK appends `stream: true` internally.
 	stream := a.client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
 		Model:     "minimax-m3",
 		MaxTokens: 10000,
@@ -222,38 +200,22 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 	})
 	defer stream.Close()
 
-	// We assemble an `anthropic.MessageParam` directly from the stream
-	// instead of building a `Message` and calling `.ToParam()`. Two
-	// reasons:
-	//   1. `ContentBlockUnion` (the response shape) is a flat struct with
-	//      no exported `Of*` accessors; mutating its `Text` field directly
-	//      works, but `AsText()`/`AsToolUse()` round-trip through the
-	//      fixed `JSON.raw` snapshot and discard streamed edits.
-	//   2. `MessageParam`'s `Content` is already a `[]ContentBlockParamUnion`
-	//      with tagged-pointer `OfText`/`OfToolUse` fields — which is
-	//      exactly what the `Run` loop in this file iterates, and what
-	//      the next request round-trips as conversation history.
-	// NOTE: Currently we defer all tool execution until after the
-	// full stream returns. An optimization would be to execute each
-	// tool as soon as its content_block_stop arrives (i.e., when the
-	// tool_use input is fully assembled). This would reduce latency
-	// for independent tool calls, but requires careful handling of
-	// inter-dependent tool chains and partial response error
-	// recovery.
+	// Build MessageParam from the stream instead of Message.ToParam():
+	// the response ContentBlockUnion has no Of* accessors, and
+	// AsText()/AsToolUse() round-trip through a fixed JSON snapshot and
+	// discard streamed edits.
+	//
+	// TODO: execute each tool as soon as its content_block_stop arrives
+	// to overlap independent tool calls with the stream.
 	var blocks []anthropic.ContentBlockParamUnion
 
-	// For tool_use blocks, the streamed `input_json_delta` events carry
-	// partial JSON fragments. We buffer them per-block-index and
-	// materialize a single `json.RawMessage` at `content_block_stop`.
 	type toolBuilder struct {
 		id, name string
-		inputBuf bytes.Buffer
+		inputBuf bytes.Buffer // partial JSON; materialized at content_block_stop
 	}
 	builders := map[int64]*toolBuilder{}
 
-	// Track whether we've printed the "AI: " prefix yet for this turn so
-	// that streamed text appears as one continuous line ("AI: hello there")
-	// instead of being prefixed on every delta.
+	// Print "AI: " once per turn so deltas flow on a single line.
 	aiPrefixPrinted := false
 	printAIPrefix := func() {
 		if aiPrefixPrinted {
@@ -267,9 +229,6 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 		ev := stream.Current()
 		switch ev.Type {
 		case "message_start":
-			// Nothing to capture — `message_start.Message` is the response
-			// shape; we don't need its fields here. Stop reason lands in
-			// `message_delta` and isn't surfaced to the conversation.
 			_ = ev.Message
 		case "content_block_start":
 			idx := ev.Index
@@ -321,13 +280,10 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 				}
 			}
 		case "message_delta":
-			// Carries stop_reason and cumulative usage. Nothing in this
-			// agent surfaces those, but we consume the event so the loop
-			// stays symmetric with the wire protocol.
+			// stop_reason / usage — not surfaced by this agent.
 			_ = ev.Delta
 			_ = ev.Usage
 		case "message_stop":
-			// Final event; loop terminates on the next Next().
 		}
 	}
 
@@ -335,11 +291,9 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 		return anthropic.MessageParam{}, err
 	}
 
-	// If any text streamed this turn, terminate with a newline so the next
-	// `You:` prompt lands on its own line. (Non-streaming printed `\n`
-	// once per text block; streaming prints once at end-of-text.) If only
-	// tool_use blocks came back, we still want a newline so any
-	// `tool: ...` lines that follow aren't glued to a prior prompt.
+	// Newline so the next You: prompt lands on its own line, even when
+	// only tool_use blocks came back (so tool: ... lines aren't glued
+	// to the prior prompt).
 	if aiPrefixPrinted {
 		os.Stdout.Write([]byte("\n"))
 	}
@@ -451,7 +405,7 @@ func ListFiles(input json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(result), nil // json.Marshal returns []byte
+	return string(result), nil
 }
 
 var EditFileDefinition = ToolDefinition{
@@ -494,11 +448,10 @@ func EditFile(input json.RawMessage) (string, error) {
 	}
 
 	oldContent := string(content)
-	// replace all occurrences
 	const replaceAll = -1
 	newContent := strings.Replace(oldContent, editFileInput.OldStr, editFileInput.NewStr, replaceAll)
 
-	// empty oldStr means new file creation; skip equality check to avoid false "not found" error
+	// oldStr == "" is the new-file path; that path is handled above.
 	if oldContent == newContent && editFileInput.OldStr != "" {
 		return "", fmt.Errorf("old_str not found in file")
 	}
@@ -561,19 +514,17 @@ func Bash(input json.RawMessage) (string, error) {
 		"duration_ms": durationMs,
 	}
 
-	// Distinguish: a non-zero exit is a successful *tool call* (the command ran;
-	// the model should see stderr and decide what to do). A real execution
-	// failure (command missing, timeout, etc.) is an is_error=true result.
+	// A non-zero exit is a *successful* tool call (model reads stderr
+	// and decides). Only exec-time failures (timeout, missing binary)
+	// set the error field.
 	if runErr != nil {
-		// context.DeadlineExceeded is the timeout case.
 		if ctx.Err() == context.DeadlineExceeded {
 			result["error"] = "command timed out after " + bashDefaultTimeout.String()
 			result["timed_out"] = true
-		} else if ee, ok := runErr.(*exec.ExitError); ok {
-			// Non-zero exit. Already captured exit_code above; no extra error field.
-			_ = ee
+		} else if _, ok := runErr.(*exec.ExitError); ok {
+			// exit_code captured above.
 		} else {
-			// Couldn't even start the command (e.g. /bin/bash missing).
+			// Couldn't start the command (e.g. /bin/bash missing).
 			result["error"] = runErr.Error()
 		}
 	}
@@ -590,7 +541,6 @@ func createNewFile(filePath, content string) (string, error) {
 	if dir != "." {
 		err := os.MkdirAll(dir, 0755)
 		if err != nil {
-			// %w wraps the error for proper error chain unwrapping
 			return "", fmt.Errorf("failed to create directory: %w", err)
 		}
 	}
