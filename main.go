@@ -8,10 +8,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,7 +41,7 @@ func main() {
 
 	// Default to the OpenCode Zen Go endpoint when ANTHROPIC_BASE_URL
 	// is unset; otherwise let the user's value win.
-	opts := []option.RequestOption{option.WithHeader("x-opencode-session", strconv.FormatInt(time.Now().UnixNano(), 10))}
+	opts := []option.RequestOption{option.WithHeader("x-opencode-session", strconv.FormatInt(time.Now().UnixNano(), 10)), option.WithHeader("User-Agent", "zone/0.1")}
 	if _, ok := os.LookupEnv("ANTHROPIC_BASE_URL"); !ok {
 		opts = append(opts, option.WithBaseURL(defaultBaseURL))
 	}
