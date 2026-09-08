@@ -22,6 +22,8 @@ import (
 
 const defaultBaseURL = "https://opencode.ai/zen/go"
 
+const systemPrompt = "You are a coding agent - start from exploring the current directory"
+
 func main() {
 	// Parse flags against a local FlagSet so we don't mutate the global
 	// `flag.CommandLine`. Any positional args after the flags form the
@@ -186,8 +188,11 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 	stream := a.client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
 		Model:     "minimax-m3",
 		MaxTokens: 10000,
-		Messages:  conversation,
-		Tools:     anthropicTools,
+		System: []anthropic.TextBlockParam{
+			{Text: systemPrompt},
+		},
+		Messages: conversation,
+		Tools:    anthropicTools,
 	})
 	defer stream.Close()
 
