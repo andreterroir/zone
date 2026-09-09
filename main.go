@@ -48,9 +48,6 @@ func loadSystemPrompt() []anthropic.TextBlockParam {
 		}
 	}
 
-	// cwd AGENTS.md is loaded last so working-directory-specific
-	// instructions can override repo-wide ones. Resolved relative to
-	// os.Getwd(); missing file is skipped silently.
 	if cwd, err := os.Getwd(); err == nil {
 		if content, err := os.ReadFile(filepath.Join(cwd, "AGENTS.md")); err == nil {
 			blocks = append(blocks, anthropic.TextBlockParam{
@@ -62,11 +59,8 @@ func loadSystemPrompt() []anthropic.TextBlockParam {
 	return blocks
 }
 
-// gitRepoRoot returns the absolute path of the current git working tree's
-// top-level directory, or an error if the cwd is not inside a repository.
-// Implemented via `git rev-parse --show-toplevel`; failures (no git on
-// PATH, not in a repo) are returned to the caller so it can skip silently,
-// matching how loadSystemPrompt handles missing agent-instruction files.
+// gitRepoRoot returns the git working tree's top-level directory, or an
+// error if the cwd is not inside one.
 func gitRepoRoot() (string, error) {
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
 	out, err := cmd.Output()
