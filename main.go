@@ -28,20 +28,20 @@ const globalAgentsLocalPath = "/home/andrew/.agents/AGENTS.local.md"
 func loadSystemPrompt() []anthropic.TextBlockParam {
 	blocks := []anthropic.TextBlockParam{{Text: systemPrompt}}
 
-	if content, err := os.ReadFile(globalAgentsPath); err == nil {
+	if content, ok := readAgentsFile(globalAgentsPath); ok {
 		blocks = append(blocks, anthropic.TextBlockParam{
 			Text: "# Agent Instructions\n\n" + string(content),
 		})
 	}
 
-	if content, err := os.ReadFile(globalAgentsLocalPath); err == nil {
+	if content, ok := readAgentsFile(globalAgentsLocalPath); ok {
 		blocks = append(blocks, anthropic.TextBlockParam{
 			Text: "# Machine Specific Agent Instructions\n\n" + string(content),
 		})
 	}
 
 	if root, err := gitRepoRoot(); err == nil {
-		if content, err := os.ReadFile(filepath.Join(root, "AGENTS.md")); err == nil {
+		if content, ok := readAgentsFile(filepath.Join(root, "AGENTS.md")); ok {
 			blocks = append(blocks, anthropic.TextBlockParam{
 				Text: "# Repository Agent Instructions\n\n" + string(content),
 			})
@@ -49,7 +49,7 @@ func loadSystemPrompt() []anthropic.TextBlockParam {
 	}
 
 	if cwd, err := os.Getwd(); err == nil {
-		if content, err := os.ReadFile(filepath.Join(cwd, "AGENTS.md")); err == nil {
+		if content, ok := readAgentsFile(filepath.Join(cwd, "AGENTS.md")); ok {
 			blocks = append(blocks, anthropic.TextBlockParam{
 				Text: "# Working Directory Agent Instructions\n\n" + string(content),
 			})
@@ -57,6 +57,21 @@ func loadSystemPrompt() []anthropic.TextBlockParam {
 	}
 
 	return blocks
+}
+
+// readAgentsFile reads an agent instructions file, preferring the
+// lowercase "agents.md" before falling back to uppercase "AGENTS.md".
+// Either case works; the lowercase variant wins when both exist.
+func readAgentsFile(upperPath string) ([]byte, bool) {
+	lowerPath := strings.ToLower(upperPath)
+
+	if content, err := os.ReadFile(lowerPath); err == nil {
+		return content, true
+	}
+	if content, err := os.ReadFile(upperPath); err == nil {
+		return content, true
+	}
+	return nil, false
 }
 
 // gitRepoRoot returns the git working tree's top-level directory, or an
