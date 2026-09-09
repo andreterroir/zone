@@ -41,4 +41,8 @@ and `User-Agent: zone/0.1`.
 Every turn's system prompt is: `systemPrompt`, then
 `~/.agents/AGENTS.md` (if readable) under `# Agent Instructions`, then
 `~/.agents/AGENTS.local.md` (if readable) under `# Machine Specific
-Agent Instructions`. Missing files are skipped silently.
+Agent Instructions`, then the repository's `<root>/AGENTS.md` (if the
+cwd is inside a git repo and the file is readable) under `# Repository
+Agent Instructions`. Missing files and a missing git repository are
+skipped silently. The repo root is resolved with
+`git rev-parse --show-toplevel`.

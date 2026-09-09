@@ -40,7 +40,29 @@ func loadSystemPrompt() []anthropic.TextBlockParam {
 		})
 	}
 
+	if root, err := gitRepoRoot(); err == nil {
+		if content, err := os.ReadFile(filepath.Join(root, "AGENTS.md")); err == nil {
+			blocks = append(blocks, anthropic.TextBlockParam{
+				Text: "# Repository Agent Instructions\n\n" + string(content),
+			})
+		}
+	}
+
 	return blocks
+}
+
+// gitRepoRoot returns the absolute path of the current git working tree's
+// top-level directory, or an error if the cwd is not inside a repository.
+// Implemented via `git rev-parse --show-toplevel`; failures (no git on
+// PATH, not in a repo) are returned to the caller so it can skip silently,
+// matching how loadSystemPrompt handles missing agent-instruction files.
+func gitRepoRoot() (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func main() {
