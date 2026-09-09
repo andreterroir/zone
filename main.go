@@ -48,6 +48,17 @@ func loadSystemPrompt() []anthropic.TextBlockParam {
 		}
 	}
 
+	// cwd AGENTS.md is loaded last so working-directory-specific
+	// instructions can override repo-wide ones. Resolved relative to
+	// os.Getwd(); missing file is skipped silently.
+	if cwd, err := os.Getwd(); err == nil {
+		if content, err := os.ReadFile(filepath.Join(cwd, "AGENTS.md")); err == nil {
+			blocks = append(blocks, anthropic.TextBlockParam{
+				Text: "# Working Directory Agent Instructions\n\n" + string(content),
+			})
+		}
+	}
+
 	return blocks
 }
 

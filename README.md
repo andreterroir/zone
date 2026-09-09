@@ -43,6 +43,7 @@ Every turn's system prompt is: `systemPrompt`, then
 `~/.agents/AGENTS.local.md` (if readable) under `# Machine Specific
 Agent Instructions`, then the repository's `<root>/AGENTS.md` (if the
 cwd is inside a git repo and the file is readable) under `# Repository
-Agent Instructions`. Missing files and a missing git repository are
-skipped silently. The repo root is resolved with
-`git rev-parse --show-toplevel`.
+Agent Instructions`, then `./AGENTS.md` (if readable relative to the
+cwd) under `# Working Directory Agent Instructions`. Missing files and
+a missing git repository are skipped silently. The repo root is
+resolved with `git rev-parse --show-toplevel`.
