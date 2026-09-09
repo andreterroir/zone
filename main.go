@@ -21,18 +21,10 @@ import (
 )
 
 const defaultBaseURL = "https://opencode.ai/zen/go"
-
 const systemPrompt = "You are a coding agent named zone - start from exploring the current directory"
-
-// User-global AGENTS.md (Claude Code / friends use this path by convention).
 const globalAgentsPath = "/home/andrew/.agents/AGENTS.md"
-
-// Sibling the global AGENTS.md instructs the agent to also read.
 const globalAgentsLocalPath = "/home/andrew/.agents/AGENTS.local.md"
 
-// loadSystemPrompt returns the base prompt, then AGENTS.md under
-// "# Agent Instructions", then AGENTS.local.md under
-// "# Machine Specific Agent Instructions". Unreadable files are skipped.
 func loadSystemPrompt() []anthropic.TextBlockParam {
 	blocks := []anthropic.TextBlockParam{{Text: systemPrompt}}
 
